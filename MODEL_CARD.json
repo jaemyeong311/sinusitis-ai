@@ -1,0 +1,34 @@
+{
+  "project": "Sinusitis 4-class CorrectFlip PyTorch",
+  "recommended_checkpoint": "best_val_loss.pt",
+  "backup_checkpoint": "final_model.pt",
+  "model_input": "RGB float32, shape [N,3,96,96], range 0..1",
+  "class_order": [
+    "Normal",
+    "Left",
+    "Right",
+    "Both"
+  ],
+  "internal_result": {
+    "accuracy": 0.8946875,
+    "balanced_accuracy": 0.8948718186,
+    "macro_f1": 0.8946062113,
+    "macro_auc": 0.9829046994
+  },
+  "checkpoint_epoch": 35,
+  "note": "The 3,200-sample score is augment/CutMix-then-split internal reproduction, not external validation.",
+  "files": {
+    "best_val_loss.pt": {
+      "sha256": "ebe7c84b7b166366dc6eb7f34cb329524e94deeace75e2967a3bbe3aea62c553",
+      "bytes": 448553
+    },
+    "final_model.pt": {
+      "sha256": "9f5c1833fb87c98d4541d5d2763e61e9fcc0cc8058f8155c24399e788a995c4f",
+      "bytes": 449065
+    },
+    "model_definition_lightcnn_v2.py": {
+      "sha256": "4c12f80d862cda4e8b5aca651236ad95285e974db3f2a39b4e436be8044eacfa",
+      "bytes": 520
+    }
+  }
+}
