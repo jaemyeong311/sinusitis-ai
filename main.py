@@ -15,12 +15,12 @@ matplotlib.use("Agg")
 import numpy as np
 import torch
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile
-from PIL import Image, UnidentifiedImageError
+from PIL import Image
+from media_frames import MediaError, extract_frames
 
 from gradcam_lightcnn_v1 import (
     GradCAM,
     load_checkpoint_model,
-    preprocess_image,
 )
 from model_definition_lightcnn_v2 import CLASS_ORDER
 
@@ -32,8 +32,8 @@ from model_definition_lightcnn_v2 import CLASS_ORDER
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / "best_val_loss.pt"
 
-MAX_FILE_SIZE = 5 * 1024 * 1024
-MAX_IMAGE_PIXELS = 16_000_000
+MAX_FILE_SIZE = 30 * 1024 * 1024
+MAX_STILL_IMAGE_SIZE = 5 * 1024 * 1024
 
 MODEL_VERSION = "CorrectFlip-LightCNN-v2-GradCAM-v1-bilinear"
 
@@ -138,108 +138,100 @@ def predict(
                     detail="API 키가 올바르지 않습니다.",
                 )
 
-        # 업로드 파일 형식 검사
+        # 업로드 형식 및 크기 확인
         if image.content_type not in (
-            "image/jpeg",
-            "image/png",
+            "image/jpeg", "image/png", "image/gif", "video/mp4",
         ):
             raise HTTPException(
                 status_code=415,
-                detail="JPG 또는 PNG 파일만 업로드해주세요.",
+                detail="JPG, PNG, GIF, MP4 파일만 업로드해주세요.",
             )
 
-        # 파일 크기 검사
-        image_bytes = image.file.read(
-            MAX_FILE_SIZE + 1
-        )
-
+        image_bytes = image.file.read(MAX_FILE_SIZE + 1)
         if not image_bytes:
-            raise HTTPException(
-                status_code=400,
-                detail="빈 이미지 파일입니다.",
-            )
-
+            raise HTTPException(status_code=400, detail="빈 파일입니다.")
         if len(image_bytes) > MAX_FILE_SIZE:
             raise HTTPException(
                 status_code=413,
-                detail="이미지는 5MB 이하로 업로드해주세요.",
+                detail="GIF/MP4 파일은 30MB 이하여야 합니다.",
             )
-
-        # 실제 이미지 검증 및 전처리
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter(
-                    "error",
-                    Image.DecompressionBombWarning,
-                )
-
-                with Image.open(
-                    BytesIO(image_bytes)
-                ) as source:
-                    if source.format not in ("JPEG", "PNG"):
-                        raise HTTPException(
-                            status_code=415,
-                            detail="실제 파일 형식이 JPG 또는 PNG가 아닙니다.",
-                        )
-
-                    if (
-                        source.width * source.height
-                        > MAX_IMAGE_PIXELS
-                    ):
-                        raise HTTPException(
-                            status_code=413,
-                            detail="이미지는 1,600만 픽셀 이하여야 합니다.",
-                        )
-
-                    source.verify()
-
-                # 첨부된 Grad-CAM 패키지의 전처리를 그대로 사용
-                # RGB → 96x96 BILINEAR → float32 / 255
-                # 좌우 반전은 적용하지 않음
-                rgb, tensor = preprocess_image(
-                    BytesIO(image_bytes)
-                )
-
-        except (
-            Image.DecompressionBombError,
-            Image.DecompressionBombWarning,
+        if (
+            image.content_type in ("image/jpeg", "image/png")
+            and len(image_bytes) > MAX_STILL_IMAGE_SIZE
         ):
             raise HTTPException(
                 status_code=413,
-                detail="이미지 해상도가 너무 큽니다.",
+                detail="JPG/PNG 이미지는 5MB 이하여야 합니다.",
             )
 
-        except (
-            UnidentifiedImageError,
-            OSError,
-            ValueError,
-            SyntaxError,
-        ):
+        # 영상은 최대 다섯 프레임을 샘플링한다. 가운데 샘플을
+        # 기존 단일 이미지 API 결과/Grad-CAM의 기준으로 사용한다.
+        try:
+            frames, source_frame_count = extract_frames(
+                image_bytes, image.content_type
+            )
+        except MediaError as exc:
             raise HTTPException(
-                status_code=400,
-                detail="이미지를 읽을 수 없거나 파일이 손상됐습니다.",
-            )
+                status_code=exc.status_code, detail=str(exc)
+            ) from exc
 
-        # Grad-CAM 계산
-        # Grad-CAM에는 gradient가 필요하므로
-        # torch.no_grad() 또는 inference_mode()를 사용하지 않음
-        with MODEL_LOCK, torch.enable_grad():
-            gradcam = GradCAM(app.state.model)
+        selected_offset = len(frames) // 2
+        selected_frame = frames[selected_offset]
+        frame_results = []
 
-            try:
-                (
-                    heatmap,
-                    probabilities,
-                    predicted,
-                    target,
-                ) = gradcam(tensor)
-
-            finally:
-                # 요청 종료 시 hook과 gradient 정리
-                gradcam.close()
-                app.state.model.zero_grad(
-                    set_to_none=True
+        # 하나의 모델을 여러 요청이 동시에 사용하지 않도록 보호
+        with MODEL_LOCK:
+            for offset, frame in enumerate(frames):
+                rgb_frame = (
+                    np.asarray(frame.image, dtype=np.float32) / 255.0
                 )
+                tensor = torch.from_numpy(
+                    rgb_frame.transpose(2, 0, 1)
+                ).unsqueeze(0)
+
+                if offset == selected_offset:
+                    # 선택한 프레임에서만 Grad-CAM 생성
+                    with torch.enable_grad():
+                        gradcam = GradCAM(app.state.model)
+                        try:
+                            (
+                                heatmap,
+                                frame_probs,
+                                frame_predicted,
+                                target,
+                            ) = gradcam(tensor)
+                        finally:
+                            gradcam.close()
+                            app.state.model.zero_grad(
+                                set_to_none=True
+                            )
+                    rgb = rgb_frame
+                    probabilities = frame_probs
+                    predicted = frame_predicted
+                else:
+                    with torch.no_grad():
+                        frame_probs = torch.softmax(
+                            app.state.model(tensor), dim=1
+                        )[0].cpu().numpy()
+                    frame_predicted = int(np.argmax(frame_probs))
+
+                if not np.isfinite(frame_probs).all():
+                    raise HTTPException(
+                        status_code=500,
+                        detail="모델 계산 결과가 올바르지 않습니다.",
+                    )
+
+                frame_results.append({
+                    "frameIndex": frame.index,
+                    "timeSeconds": frame.time_seconds,
+                    "classIndex": int(frame_predicted),
+                    "predictedLabel": CLASS_ORDER[frame_predicted],
+                    "confidence": float(frame_probs[frame_predicted]),
+                    "probabilities": {
+                        label: float(frame_probs[index])
+                        for index, label in enumerate(CLASS_ORDER)
+                    },
+                })
 
         # 계산 결과 확인
         if (
@@ -284,6 +276,13 @@ def predict(
                 for index, label in enumerate(CLASS_ORDER)
             },
             "modelVersion": MODEL_VERSION,
+            "analysisFrame": {
+                "frameIndex": selected_frame.index,
+                "timeSeconds": selected_frame.time_seconds,
+                "sampledFrames": len(frames),
+                "sourceFrameCount": source_frame_count,
+            },
+            "frameResults": frame_results,
 
             "gradcam": {
                 "targetClassIndex": int(target),
